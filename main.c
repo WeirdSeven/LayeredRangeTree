@@ -87,7 +87,7 @@ double pmax(double n1, double n2) {
     if (n1 == DBL_MAX && n2 == DBL_MAX) {
         return DBL_MAX;
     } else if (n1 == DBL_MAX) {
-c       return n2;
+        return n2;
     } else if (n2 == DBL_MAX) {
         return n1;
     } else {
