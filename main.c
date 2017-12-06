@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 typedef struct {
     double x;
@@ -263,7 +264,6 @@ Tree construct_x_tree(PointArray input) {
     return result;
 }
 
-
 typedef struct {
     size_t index;
     YArrayEntry *lower;
@@ -336,9 +336,6 @@ void follow_y_array_entry_pointers(YArrayEntry **lower_ptr, YArrayEntry **upper_
 }
 
 QueryResult query(Tree tree, Point lower_left, Point upper_right) {
-    struct timespec begin, end, end2;
-    clock_gettime(CLOCK_MONOTONIC, &begin);
-
     double x_lower = lower_left.x;
     double x_upper = upper_right.x;
     double y_lower = lower_left.y;
@@ -373,7 +370,7 @@ QueryResult query(Tree tree, Point lower_left, Point upper_right) {
         return null_result;
     }
 
-     // Search for x_lower
+    // Search for x_lower
     size_t cur_node_index = 1;
     YArrayEntry *y_lower_ptr = y_lower_ptr_root;
     YArrayEntry *y_upper_ptr = y_upper_ptr_root;
@@ -449,7 +446,7 @@ QueryResult query(Tree tree, Point lower_left, Point upper_right) {
         return null_result;
     }
 
-     // Search for x_upper
+    // Search for x_upper
     cur_node_index = 1;
     y_lower_ptr = y_lower_ptr_root;
     y_upper_ptr = y_upper_ptr_root;
@@ -528,7 +525,312 @@ QueryResult query(Tree tree, Point lower_left, Point upper_right) {
         return null_result;
     }
 
+    // Search for the first level where the two paths differ
+    size_t split_height = height;
+    {
+        size_t i = 0;
+        while (i <= x_lower_search_height && i <= x_upper_search_height) {
+            if (x_lower_path_record[i].index == x_upper_path_record[i].index) {
+                ++i;
+            } else {
+                break;
+            }
+        }
+        split_height = i;
+    }
 
+    QueryResultPart *x_lower_path_result = (QueryResultPart *) malloc(sizeof(QueryResultPart) * (height - split_height));
+    QueryResultPart *x_upper_path_result = (QueryResultPart *) malloc(sizeof(QueryResultPart) * (height - split_height));
+
+    // Collect results for the lower branch
+    size_t x_lower_result_size = 0;
+    for (size_t i = x_lower_search_height; i >= split_height; --i) {
+        QueryRecord *cur_record = &x_lower_path_record[i];
+
+        if (cur_record->lower && cur_record->upper) {
+            QueryResultPart *cur_result = &x_lower_path_result[x_lower_result_size];
+            cur_result->lower = cur_record->lower;
+            cur_result->upper = cur_record->upper;
+            cur_result->size = cur_record->upper - cur_record->lower + 1;
+
+            x_lower_result_size += 1;
+        }
+    }
+
+    // Collect results for the upper branch
+    size_t x_upper_result_size = 0;
+    for (size_t i = split_height; i <= x_upper_search_height; ++i) {
+        QueryRecord *cur_record = &x_upper_path_record[i];
+
+        if (cur_record->lower && cur_record->upper) {
+            QueryResultPart *cur_result = &x_upper_path_result[x_upper_result_size];
+            cur_result->lower = cur_record->lower;
+            cur_result->upper = cur_record->upper;
+            cur_result->size = cur_record->upper - cur_record->lower + 1;
+
+            x_upper_result_size += 1;
+        }
+    }
+
+    size_t result_size = x_lower_result_size + x_upper_result_size ;
+    QueryResultPart *results = (QueryResultPart *) malloc(sizeof(QueryResultPart) * result_size);
+    memcpy(results, x_lower_path_result, sizeof(QueryResultPart) * x_lower_result_size);
+    memcpy(results + x_lower_result_size, x_upper_path_result, sizeof(QueryResultPart) * x_upper_result_size);
+
+    QueryResult result = { results, result_size };
+    return result;
+}
+
+typedef struct {
+    double x_lower;
+    Tree tree;
+    YArrayEntry *y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr_root;
+    QueryRecord *x_lower_path_record;
+    int *x_lower_gt_max;
+    size_t *x_lower_search_height;
+} search_lower_t;
+
+void *search_x_lower(void *arg) {
+    search_lower_t *search_arguments = (search_lower_t *) arg;
+    double x_lower = search_arguments->x_lower;
+    Tree tree= search_arguments->tree;
+    YArrayEntry *y_lower_ptr_root = search_arguments->y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr_root = search_arguments->y_upper_ptr_root;
+    QueryRecord *x_lower_path_record = search_arguments->x_lower_path_record;
+    int *x_lower_gt_max = search_arguments->x_lower_gt_max;
+    size_t *x_lower_search_height = search_arguments->x_lower_search_height;
+
+    size_t height = log2(tree.size);
+    size_t cur_node_index = 1;
+    YArrayEntry *y_lower_ptr = y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr = y_upper_ptr_root;
+    *x_lower_gt_max = 0;
+
+    for (size_t i = 0; i < height; ++i) {
+        *x_lower_search_height = i;
+        QueryRecord *cur_record = &x_lower_path_record[i];
+        TreeNode *cur_node = &tree.nodes[cur_node_index];
+
+        // We know if x_lower is greater than max
+        // exactly at the root level
+        if (x_lower > cur_node->right_max) {
+            *x_lower_gt_max = 1;
+            break;
+        }
+
+        // The leave level is handled differently
+        if (i == height - 1) {
+            assert(x_lower <= cur_node->left_max);
+            assert(y_lower_ptr == y_upper_ptr);
+            cur_record->index = cur_node_index;
+            cur_record->lower = y_lower_ptr;
+            cur_record->upper = y_upper_ptr;      
+        } else {
+            double y_lower_value = y_lower_ptr->p.y;
+            double y_upper_value = y_upper_ptr->p.y;
+            YArrayEntry *y_lower_ptr_right = y_lower_ptr->right;
+            YArrayEntry *y_upper_ptr_right = y_upper_ptr->right;
+            YArrayEntry *y_lower_ptr_left = y_lower_ptr->left;
+            YArrayEntry *y_upper_ptr_left = y_upper_ptr->left;
+
+            // Take a left
+            if (x_lower <= cur_node->left_max) {
+                cur_record->index = cur_node_index;
+                follow_y_array_entry_pointers(&cur_record->lower, &cur_record->upper,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_right, y_upper_ptr_right);
+                // There are no corresponding points in this subtree
+                if (cur_record->lower > cur_record->upper) {
+                    cur_record->lower = cur_record->upper = NULL;
+                }
+
+
+                cur_node_index = cur_node_index << 1;
+                follow_y_array_entry_pointers(&y_lower_ptr, &y_upper_ptr,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_left, y_upper_ptr_left);
+                // There are no corresponding points in this subtree. Stop searching
+                if (y_lower_ptr > y_upper_ptr) {
+                    break;
+                }
+            } // Take a right
+            else {
+                cur_record->index = cur_node_index;
+                cur_record->lower = NULL;
+                cur_record->upper = NULL;
+
+                cur_node_index = (cur_node_index << 1) + 1;
+                follow_y_array_entry_pointers(&y_lower_ptr, &y_upper_ptr,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_right, y_upper_ptr_right);
+                if (y_lower_ptr > y_upper_ptr) {
+                    break;
+                }
+            } 
+        }
+    }
+
+    return NULL;
+}
+
+typedef struct {
+    double x_upper;
+    Tree tree;
+    YArrayEntry *y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr_root;
+    QueryRecord *x_upper_path_record;
+    int *x_upper_lt_min;
+    size_t *x_upper_search_height;
+} search_upper_t;
+
+void *search_x_upper(void *arg) {
+    search_upper_t *search_arguments = (search_upper_t *) arg;
+    double x_upper = search_arguments->x_upper;
+    Tree tree= search_arguments->tree;
+    YArrayEntry *y_lower_ptr_root = search_arguments->y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr_root = search_arguments->y_upper_ptr_root;
+    QueryRecord *x_upper_path_record = search_arguments->x_upper_path_record;
+    int *x_upper_lt_min = search_arguments->x_upper_lt_min;
+    size_t *x_upper_search_height = search_arguments->x_upper_search_height;
+
+    size_t height = log2(tree.size);
+    size_t cur_node_index = 1;
+    YArrayEntry *y_lower_ptr = y_lower_ptr_root;
+    YArrayEntry *y_upper_ptr = y_upper_ptr_root;
+    *x_upper_lt_min = 0;
+
+    for (size_t i = 0; i < height; ++i) {
+        *x_upper_search_height = i;
+        QueryRecord *cur_record = &x_upper_path_record[i];
+        TreeNode *cur_node = &tree.nodes[cur_node_index];
+
+        // We only know if x_upper is less than min
+        // at the leave level. Here left_max = right_max
+        if (cur_node_index == tree.size >> 1 && x_upper < cur_node->left_max) {
+            *x_upper_lt_min = 1;
+            break;
+        }
+
+        if (i == height - 1) {
+            assert(y_lower_ptr == y_upper_ptr);
+            cur_record->index = cur_node_index;
+            if (x_upper >= cur_node->left_max) {
+                cur_record->lower = y_lower_ptr;
+                cur_record->upper = y_upper_ptr; 
+            } else {
+                cur_record->lower = cur_record->upper = NULL;
+            } 
+        } else {
+            double y_lower_value = y_lower_ptr->p.y;
+            double y_upper_value = y_upper_ptr->p.y;
+            YArrayEntry *y_lower_ptr_right = y_lower_ptr->right;
+            YArrayEntry *y_upper_ptr_right = y_upper_ptr->right;
+            YArrayEntry *y_lower_ptr_left = y_lower_ptr->left;
+            YArrayEntry *y_upper_ptr_left = y_upper_ptr->left;
+
+            // Take a left. Be careful to handle duplicates correctly
+            // and not walk off the tree
+            if ((x_upper <= cur_node->left_max && x_upper < cur_node->right_max)
+                || cur_node->right_max == DBL_MAX) {
+                //printf("Take a left\n");
+                cur_record->index = cur_node_index;
+                cur_record->lower = NULL;
+                cur_record->upper = NULL;
+
+                cur_node_index = cur_node_index << 1;
+                follow_y_array_entry_pointers(&y_lower_ptr, &y_upper_ptr,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_left, y_upper_ptr_left);
+
+                if (y_lower_ptr > y_upper_ptr) {
+                    break;
+                }
+            } // Take a right
+            else {
+                cur_record->index = cur_node_index;
+                follow_y_array_entry_pointers(&cur_record->lower, &cur_record->upper,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_left, y_upper_ptr_left);
+                if (cur_record->lower > cur_record->upper) {
+                    cur_record->lower = cur_record->upper = NULL;
+                }
+
+                cur_node_index = (cur_node_index << 1) + 1;
+                follow_y_array_entry_pointers(&y_lower_ptr, &y_upper_ptr,
+                                                y_lower_value, y_upper_value,
+                                                y_lower_ptr_right, y_upper_ptr_right);
+                if (y_lower_ptr > y_upper_ptr) {
+                    break;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+QueryResult query_parallel(Tree tree, Point lower_left, Point upper_right) {
+    double x_lower = lower_left.x;
+    double x_upper = upper_right.x;
+    double y_lower = lower_left.y;
+    double y_upper = upper_right.y;
+
+    QueryResult null_result = { NULL, 0};
+    if (x_lower > x_upper) {
+        printf("x lower is greater than x upper!\n");
+        return null_result;
+    }
+    if (y_lower > y_upper) {
+        printf("y lower is greater than y upper!\n");
+        return null_result;
+    }
+
+     // This is the textbook definition of height plus 1
+    size_t height = log2(tree.size);
+
+    QueryRecord *x_lower_path_record = (QueryRecord *) malloc(sizeof(QueryRecord) * height);
+    QueryRecord *x_upper_path_record = (QueryRecord *) malloc(sizeof(QueryRecord) * height);
+
+    TreeNode *root = &tree.nodes[1];
+    YArrayEntry *y_lower_ptr_root = binary_search_lower(root->y_array, root->size, y_lower);
+     //printf("Here\n");
+    if (y_lower_ptr_root == NULL) {
+        printf("y lower is greater than max!\n");
+        return null_result;
+    }
+    YArrayEntry *y_upper_ptr_root = binary_search_upper(root->y_array, root->size, y_upper);
+    if (y_upper_ptr_root == NULL) {
+        printf("y upper is less than min!\n");
+        return null_result;
+    }
+
+    int x_lower_gt_max;
+    int x_upper_lt_min;
+
+    size_t x_lower_search_height;
+    size_t x_upper_search_height;
+
+    pthread_t threads[2];
+
+    search_lower_t search_lower_arguments = { x_lower, tree, y_lower_ptr_root, y_upper_ptr_root, x_lower_path_record, &x_lower_gt_max, &x_lower_search_height };
+    search_upper_t search_upper_arguments = { x_upper, tree, y_lower_ptr_root, y_upper_ptr_root, x_upper_path_record, &x_upper_lt_min, &x_upper_search_height };
+
+    pthread_create(&threads[0], NULL, search_x_lower, &search_lower_arguments);
+    pthread_create(&threads[1], NULL, search_x_upper, &search_upper_arguments);
+
+    pthread_join(threads[0], NULL);
+    pthread_join(threads[1], NULL); 
+
+    if (x_lower_gt_max) {
+        printf("x lower is greater than max!\n");
+        return null_result;
+    }
+    if (x_upper_lt_min) {
+        printf("x upper is less than min!\n");
+        return null_result;
+    }
 
     // Search for the first level where the two paths differ
     size_t split_height = height;
@@ -582,10 +884,6 @@ QueryResult query(Tree tree, Point lower_left, Point upper_right) {
     memcpy(results, x_lower_path_result, sizeof(QueryResultPart) * x_lower_result_size);
     memcpy(results + x_lower_result_size, x_upper_path_result, sizeof(QueryResultPart) * x_upper_result_size);
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double elapsed_time = (end.tv_nsec - begin.tv_nsec) / 1000000000.0 + (end.tv_sec  - begin.tv_sec);
-    printf("Range Tree Time: %f\n", elapsed_time);
-
     QueryResult result = { results, result_size };
     return result;
 }
@@ -617,9 +915,6 @@ PointArray get_point_array_from_query_result(QueryResult query_result) {
 }
 
 PointArray linear_query(PointArray point_array, Point lower_left, Point upper_right) {
-    struct timespec begin, end;
-    clock_gettime(CLOCK_MONOTONIC, &begin);
-
     Point *points = (Point *) malloc(sizeof(Point) * point_array.size);
     size_t num_points = 0;
     for (size_t i = 0; i < point_array.size; i++) {
@@ -630,10 +925,6 @@ PointArray linear_query(PointArray point_array, Point lower_left, Point upper_ri
             num_points += 1;
         }
     }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double elapsed_time = (end.tv_nsec - begin.tv_nsec) / 1000000000.0 + (end.tv_sec  - begin.tv_sec);
-    printf("Linear Time: %f\n", elapsed_time);
 
     PointArray result = { points, num_points };
     return result;
@@ -652,27 +943,38 @@ int main(int argc, char **argv) {
 
     //print_tree(x_tree);
 
-    do {
-        Point lower_left;
-        Point upper_right;
+    double range = sqrt(input.size) / 4;
+    Point lower_left = { -range, - range};
+    Point upper_right = { range, range };
 
-        printf("Please enter the query (in the order of lower-left.x lower-left.y upper-right.x upper-right.y, enter all zeros to terminate): ");
-        scanf("%lf %lf %lf %lf", &lower_left.x, &lower_left.y, &upper_right.x, &upper_right.y);
+    struct timespec begin1, end1;
+    clock_gettime(CLOCK_MONOTONIC, &begin1);
+    QueryResult query_result = query(x_tree, lower_left, upper_right);
+    clock_gettime(CLOCK_MONOTONIC, &end1);
+    double elapsed_time1 = (end1.tv_nsec - begin1.tv_nsec) / 1000000000.0 + (end1.tv_sec  - begin1.tv_sec);
+    printf("Range Tree Time: %f\n", elapsed_time1);
+    //PointArray point_array = get_point_array_from_query_result(query_result);
+    //print_point_array(point_array);
 
-        if (lower_left.x == 0 && lower_left.y == 0 & upper_right.x == 0 && upper_right.y == 0)
-            break;
+    struct timespec begin2, end2;
+    clock_gettime(CLOCK_MONOTONIC, &begin2);
+    PointArray linear_point_array = linear_query(input, lower_left, upper_right);
+    clock_gettime(CLOCK_MONOTONIC, &end2);
+    double elapsed_time2 = (end2.tv_nsec - begin2.tv_nsec) / 1000000000.0 + (end2.tv_sec  - begin2.tv_sec);
+    printf("Linear Time: %f\n", elapsed_time2);
+    //print_point_array(linear_point_array);
 
-        QueryResult query_result = query(x_tree, lower_left, upper_right);
-        PointArray point_array = get_point_array_from_query_result(query_result);
-        printf("Range: \n");
-        //print_point_array(point_array);
-        PointArray linear_point_array = linear_query(input, lower_left, upper_right);
-        printf("Linear: \n");
-        //print_point_array(linear_point_array);
+    struct timespec begin3, end3;
+    clock_gettime(CLOCK_MONOTONIC, &begin3);
+    QueryResult query_result3 = query_parallel(x_tree, lower_left, upper_right);
+    clock_gettime(CLOCK_MONOTONIC, &end3);
+    double elapsed_time3 = (end3.tv_nsec - begin3.tv_nsec) / 1000000000.0 + (end3.tv_sec  - begin3.tv_sec);
+    printf("Range Tree Time (Parallel): %f\n", elapsed_time3);
 
-        free(point_array.points);
-        free(linear_point_array.points);
-    } while (1);
+    free(query_result.results);
+    //free(point_array.points);
+    free(linear_point_array.points);
+    free(query_result3.results);
 
     return 0;
 }
